@@ -4,7 +4,6 @@ export class Matchmaker extends DurableObject<Env> {
 	private waitingQueue: Set<string> = new Set();
 	private userSockets: Map<string, WebSocket> = new Map();
 	private roomAssociations: Map<string, string> = new Map();
-	private matchingScheduled = false;
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
@@ -45,10 +44,9 @@ export class Matchmaker extends DurableObject<Env> {
 				}),
 			);
 
-			// Schedule batch matching if 2+ users waiting
-			if (this.waitingQueue.size >= 2 && !this.matchingScheduled) {
-				this.matchingScheduled = true;
-				await this.ctx.storage.setAlarm(Date.now() + 5000);
+			// Try to match immediately if 2+ users waiting
+			if (this.waitingQueue.size >= 2) {
+				await this.performMatching();
 			}
 
 			return new Response(null, { status: 101, webSocket: client });
@@ -65,8 +63,6 @@ export class Matchmaker extends DurableObject<Env> {
 	}
 
 	private async performMatching() {
-		this.matchingScheduled = false;
-
 		if (this.waitingQueue.size < 2) return;
 
 		const waiting = Array.from(this.waitingQueue);
@@ -143,16 +139,6 @@ export class Matchmaker extends DurableObject<Env> {
 				}),
 			);
 		}
-
-		// Schedule another round if still 2+ waiting
-		if (this.waitingQueue.size >= 2 && !this.matchingScheduled) {
-			this.matchingScheduled = true;
-			await this.ctx.storage.setAlarm(Date.now() + 5000);
-		}
-	}
-
-	async alarm() {
-		await this.performMatching();
 	}
 
 	async webSocketMessage(ws: WebSocket, msg: string) {
@@ -205,10 +191,9 @@ export class Matchmaker extends DurableObject<Env> {
 						}),
 					);
 
-					// Schedule batch matching if 2+ users waiting
-					if (this.waitingQueue.size >= 2 && !this.matchingScheduled) {
-						this.matchingScheduled = true;
-						await this.ctx.storage.setAlarm(Date.now() + 5000);
+					// Try to match immediately if 2+ users waiting
+					if (this.waitingQueue.size >= 2) {
+						await this.performMatching();
 					}
 					return;
 				}
@@ -327,10 +312,9 @@ export class Matchmaker extends DurableObject<Env> {
 			this.roomAssociations.delete(userId);
 		}
 
-		// Schedule batch matching if 2+ users waiting
-		if (this.waitingQueue.size >= 2 && !this.matchingScheduled) {
-			this.matchingScheduled = true;
-			await this.ctx.storage.setAlarm(Date.now() + 5000);
+		// Try to match immediately if 2+ users waiting
+		if (this.waitingQueue.size >= 2) {
+			await this.performMatching();
 		}
 	}
 
