@@ -1,12 +1,16 @@
 import { DurableObject } from "cloudflare:workers";
 
 export class Matchmaker extends DurableObject<Env> {
-	// biome-ignore lint/complexity/noUselessConstructor: Durable Object constructor
+	private waitingQueue: Set<string> = new Set();
+	private userSockets: Map<string, WebSocket> = new Map();
+	private roomAssociations: Map<string, string> = new Map();
+	private matchingScheduled = false;
+
+	// biome-ignore lint/complexity/noUselessConstructor: DO constructor needed
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
 	}
 
-	// Check rate limit for a user, returns true if allowed
 	private async checkRateLimit(userId: string): Promise<boolean> {
 		const limiter = this.env.LIMITERS.get(this.env.LIMITERS.idFromName(userId));
 		const response = await limiter.fetch(
@@ -18,18 +22,16 @@ export class Matchmaker extends DurableObject<Env> {
 
 	async fetch(request: Request): Promise<Response> {
 		const url = new URL(request.url);
-		const action = url.pathname.slice(1);
 
-		// WebSocket connection
 		if (request.headers.get("Upgrade") === "websocket") {
 			const userId = url.searchParams.get("userId") ?? crypto.randomUUID();
 			const userName = url.searchParams.get("userName") ?? "anonymous";
-
 			const pair = new WebSocketPair();
 			const [client, server] = Object.values(pair);
 
-			// Tags: [userId, userName, roomId or empty string]
-			this.ctx.acceptWebSocket(server, [userId, userName, ""]);
+			this.ctx.acceptWebSocket(server, [userId, userName]);
+			this.userSockets.set(userId, server);
+			this.waitingQueue.add(userId);
 
 			server.send(
 				JSON.stringify({
@@ -40,71 +42,158 @@ export class Matchmaker extends DurableObject<Env> {
 				}),
 			);
 
-			await this.tryMatch();
+			// Schedule batch matching if 2+ users waiting
+			if (this.waitingQueue.size >= 2 && !this.matchingScheduled) {
+				this.matchingScheduled = true;
+				await this.ctx.storage.setAlarm(Date.now() + 5000);
+			}
 
 			return new Response(null, { status: 101, webSocket: client });
 		}
 
-		// Status endpoint
-		if (`${request.method} ${action}` === "GET status") {
-			const sockets = this.ctx.getWebSockets();
-			const sessions = sockets.map((ws) => this.ctx.getTags(ws));
-			const waiting = sessions.filter((tags) => !tags[2]);
+		if (request.method === "GET" && url.pathname === "/status") {
 			return Response.json({
-				waitingCount: waiting.length,
-				totalConnected: sessions.length,
+				waitingCount: this.waitingQueue.size,
+				totalConnected: this.userSockets.size,
 			});
 		}
 
 		return new Response("Not Found", { status: 404 });
 	}
 
+	private async performMatching() {
+		this.matchingScheduled = false;
+
+		if (this.waitingQueue.size < 2) return;
+
+		const waiting = Array.from(this.waitingQueue);
+
+		// Shuffle for random matching
+		for (let i = waiting.length - 1; i > 0; i--) {
+			const j = Math.floor(Math.random() * (i + 1));
+			[waiting[i], waiting[j]] = [waiting[j], waiting[i]];
+		}
+
+		// Match pairs
+		for (let i = 0; i < waiting.length - 1; i += 2) {
+			const user1Id = waiting[i];
+			const user2Id = waiting[i + 1];
+			const ws1 = this.userSockets.get(user1Id);
+			const ws2 = this.userSockets.get(user2Id);
+
+			if (
+				!ws1 ||
+				!ws2 ||
+				ws1.readyState !== WebSocket.OPEN ||
+				ws2.readyState !== WebSocket.OPEN
+			) {
+				// Clean up stale entries
+				if (!ws1 || ws1.readyState !== WebSocket.OPEN) {
+					this.waitingQueue.delete(user1Id);
+					this.userSockets.delete(user1Id);
+				}
+				if (!ws2 || ws2.readyState !== WebSocket.OPEN) {
+					this.waitingQueue.delete(user2Id);
+					this.userSockets.delete(user2Id);
+				}
+				continue;
+			}
+
+			const [, user1Name] = this.ctx.getTags(ws1);
+			const [, user2Name] = this.ctx.getTags(ws2);
+			const roomId = crypto.randomUUID();
+
+			// Create room
+			const room = this.env.ROOMS.get(this.env.ROOMS.idFromName(roomId));
+			await room.fetch(
+				new Request("http://internal/init", {
+					method: "POST",
+					body: JSON.stringify({
+						roomId,
+						user1: { userId: user1Id, userName: user1Name },
+						user2: { userId: user2Id, userName: user2Name },
+					}),
+				}),
+			);
+
+			// Update in-memory state
+			this.roomAssociations.set(user1Id, roomId);
+			this.roomAssociations.set(user2Id, roomId);
+			this.waitingQueue.delete(user1Id);
+			this.waitingQueue.delete(user2Id);
+
+			// Notify users
+			ws1.send(
+				JSON.stringify({
+					type: "room_joined",
+					roomId,
+					partnerName: user2Name,
+					message: `Matched with ${user2Name}!`,
+				}),
+			);
+			ws2.send(
+				JSON.stringify({
+					type: "room_joined",
+					roomId,
+					partnerName: user1Name,
+					message: `Matched with ${user1Name}!`,
+				}),
+			);
+		}
+
+		// Schedule another round if still 2+ waiting
+		if (this.waitingQueue.size >= 2 && !this.matchingScheduled) {
+			this.matchingScheduled = true;
+			await this.ctx.storage.setAlarm(Date.now() + 5000);
+		}
+	}
+
+	async alarm() {
+		await this.performMatching();
+	}
+
 	async webSocketMessage(ws: WebSocket, msg: string) {
 		try {
-			const tags = this.ctx.getTags(ws);
-			const [userId, userName] = tags;
+			const [userId, userName] = this.ctx.getTags(ws);
 			const data = JSON.parse(msg);
+			const roomId = this.roomAssociations.get(userId);
 
-			// Check if user is in a room (using storage since tags can't be updated)
-			const roomId = await this.ctx.storage.get<string>(`room:${userId}`);
-
-			// If user is in a room, forward message to the room
 			if (roomId) {
 				const room = this.env.ROOMS.get(this.env.ROOMS.idFromName(roomId));
 
-				// Handle roll/leave commands
 				if (data.type === "roll" || data.type === "leave") {
-					// Notify room that user is leaving
 					await room.fetch(
 						new Request(`http://internal/user-left?userId=${userId}`, {
 							method: "POST",
 						}),
 					);
 
-					// Clear room association
-					await this.ctx.storage.delete(`room:${userId}`);
+					// Find and notify partner
+					let partnerId: string | undefined;
+					for (const [uid, rid] of this.roomAssociations) {
+						if (rid === roomId && uid !== userId) {
+							partnerId = uid;
+							break;
+						}
+					}
 
-					// Notify the other user in the room
-					const sockets = this.ctx.getWebSockets();
-					for (const sock of sockets) {
-						const sockTags = this.ctx.getTags(sock);
-						const sockUserId = sockTags[0];
-						const sockRoomId = await this.ctx.storage.get<string>(
-							`room:${sockUserId}`,
-						);
-						if (sockRoomId === roomId && sockUserId !== userId) {
-							sock.send(
+					this.roomAssociations.delete(userId);
+					this.waitingQueue.add(userId);
+
+					if (partnerId) {
+						const partnerWs = this.userSockets.get(partnerId);
+						if (partnerWs) {
+							partnerWs.send(
 								JSON.stringify({
 									type: "partner_left",
 									message: "Your partner has left the chat",
 								}),
 							);
-							// Clear their room association too
-							await this.ctx.storage.delete(`room:${sockUserId}`);
 						}
+						this.roomAssociations.delete(partnerId);
+						this.waitingQueue.add(partnerId);
 					}
 
-					// Send waiting status
 					ws.send(
 						JSON.stringify({
 							type: "status",
@@ -113,37 +202,30 @@ export class Matchmaker extends DurableObject<Env> {
 						}),
 					);
 
-					// Try to match again
-					await this.tryMatch();
+					// Schedule batch matching if 2+ users waiting
+					if (this.waitingQueue.size >= 2 && !this.matchingScheduled) {
+						this.matchingScheduled = true;
+						await this.ctx.storage.setAlarm(Date.now() + 5000);
+					}
 					return;
 				}
 
-				// Handle typing indicator
 				if (data.type === "typing") {
-					const sockets = this.ctx.getWebSockets();
-					for (const sock of sockets) {
-						const sockTags = this.ctx.getTags(sock);
-						const sockUserId = sockTags[0];
-						const sockRoomId = await this.ctx.storage.get<string>(
-							`room:${sockUserId}`,
-						);
-						if (sockRoomId === roomId && sockUserId !== userId) {
-							sock.send(
-								JSON.stringify({
-									type: "typing",
-									userId,
-								}),
-							);
+					// Find partner
+					for (const [uid, rid] of this.roomAssociations) {
+						if (rid === roomId && uid !== userId) {
+							const partnerWs = this.userSockets.get(uid);
+							if (partnerWs) {
+								partnerWs.send(JSON.stringify({ type: "typing", userId }));
+							}
+							break;
 						}
 					}
 					return;
 				}
 
-				// Forward message to the room
 				if (data.type === "message" && data.content) {
-					// Check rate limit before sending message
-					const allowed = await this.checkRateLimit(userId);
-					if (!allowed) {
+					if (!(await this.checkRateLimit(userId))) {
 						ws.send(
 							JSON.stringify({
 								type: "error",
@@ -165,7 +247,6 @@ export class Matchmaker extends DurableObject<Env> {
 						}),
 					);
 
-					// If room returns a broadcast payload, send to both users in room
 					if (response.ok) {
 						const responseData = (await response.json()) as Record<
 							string,
@@ -173,39 +254,34 @@ export class Matchmaker extends DurableObject<Env> {
 						>;
 						if (responseData.broadcast && responseData.payload) {
 							const payload = responseData.payload as Record<string, unknown>;
-							const sockets = this.ctx.getWebSockets();
-							for (const sock of sockets) {
-								const sockTags = this.ctx.getTags(sock);
-								const sockUserId = sockTags[0];
-								const sockRoomId = await this.ctx.storage.get<string>(
-									`room:${sockUserId}`,
-								);
-								if (sockRoomId === roomId) {
-									sock.send(
-										JSON.stringify({
-											type: "message",
-											userId,
-											userName: payload.name,
-											content: payload.message,
-											timestamp: payload.timestamp,
-										}),
-									);
+							// Broadcast to both users in the room
+							for (const [uid, rid] of this.roomAssociations) {
+								if (rid === roomId) {
+									const sock = this.userSockets.get(uid);
+									if (sock) {
+										sock.send(
+											JSON.stringify({
+												type: "message",
+												userId,
+												userName: payload.name,
+												content: payload.message,
+												timestamp: payload.timestamp,
+											}),
+										);
+									}
 								}
 							}
 						}
 					}
 				}
-			} else {
-				// User is waiting for a match
-				if (data.type === "roll") {
-					ws.send(
-						JSON.stringify({
-							type: "status",
-							status: "waiting",
-							message: "Already looking for a match...",
-						}),
-					);
-				}
+			} else if (data.type === "roll") {
+				ws.send(
+					JSON.stringify({
+						type: "status",
+						status: "waiting",
+						message: "Already looking for a match...",
+					}),
+				);
 			}
 		} catch {
 			ws.send(JSON.stringify({ type: "error", message: "Invalid message" }));
@@ -213,11 +289,11 @@ export class Matchmaker extends DurableObject<Env> {
 	}
 
 	async webSocketClose(ws: WebSocket) {
-		const tags = this.ctx.getTags(ws);
-		const [userId] = tags;
+		const [userId] = this.ctx.getTags(ws);
+		const roomId = this.roomAssociations.get(userId);
 
-		// Check if user was in a room
-		const roomId = await this.ctx.storage.get<string>(`room:${userId}`);
+		this.userSockets.delete(userId);
+		this.waitingQueue.delete(userId);
 
 		if (roomId) {
 			const room = this.env.ROOMS.get(this.env.ROOMS.idFromName(roomId));
@@ -227,98 +303,35 @@ export class Matchmaker extends DurableObject<Env> {
 				}),
 			);
 
-			// Clear room association
-			await this.ctx.storage.delete(`room:${userId}`);
-
-			// Notify the other user in the room
-			const sockets = this.ctx.getWebSockets();
-			for (const sock of sockets) {
-				const sockTags = this.ctx.getTags(sock);
-				const sockUserId = sockTags[0];
-				const sockRoomId = await this.ctx.storage.get<string>(
-					`room:${sockUserId}`,
-				);
-				if (sockRoomId === roomId && sockUserId !== userId) {
-					sock.send(
-						JSON.stringify({
-							type: "partner_disconnected",
-							message: "Your partner has disconnected",
-						}),
-					);
-					// Clear their room association too
-					await this.ctx.storage.delete(`room:${sockUserId}`);
+			// Find and notify partner
+			for (const [uid, rid] of this.roomAssociations) {
+				if (rid === roomId && uid !== userId) {
+					const partnerWs = this.userSockets.get(uid);
+					if (partnerWs) {
+						partnerWs.send(
+							JSON.stringify({
+								type: "partner_disconnected",
+								message: "Your partner has disconnected",
+							}),
+						);
+					}
+					this.roomAssociations.delete(uid);
+					this.waitingQueue.add(uid);
+					break;
 				}
 			}
+
+			this.roomAssociations.delete(userId);
+		}
+
+		// Schedule batch matching if 2+ users waiting
+		if (this.waitingQueue.size >= 2 && !this.matchingScheduled) {
+			this.matchingScheduled = true;
+			await this.ctx.storage.setAlarm(Date.now() + 5000);
 		}
 	}
 
 	async webSocketError(ws: WebSocket) {
 		await this.webSocketClose(ws);
-	}
-
-	private async tryMatch() {
-		const sockets = this.ctx.getWebSockets();
-
-		// Get all waiting users (no roomId in tags)
-		const waiting = sockets.filter((ws) => {
-			const tags = this.ctx.getTags(ws);
-			return ws.readyState === WebSocket.OPEN && !tags[2];
-		});
-
-		if (waiting.length >= 2) {
-			const user1Ws = waiting[0];
-			const user2Ws = waiting[1];
-
-			const user1Tags = this.ctx.getTags(user1Ws);
-			const user2Tags = this.ctx.getTags(user2Ws);
-
-			const roomId = crypto.randomUUID();
-
-			// Create room with both users
-			const room = this.env.ROOMS.get(this.env.ROOMS.idFromName(roomId));
-			await room.fetch(
-				new Request(`http://internal/init`, {
-					method: "POST",
-					body: JSON.stringify({
-						roomId,
-						user1: { userId: user1Tags[0], userName: user1Tags[1] },
-						user2: { userId: user2Tags[0], userName: user2Tags[1] },
-					}),
-				}),
-			);
-
-			// Update tags with roomId (this associates the WebSocket with the room)
-			this.ctx.setWebSocketAutoResponse(
-				new WebSocketRequestResponsePair("ping", "pong"),
-			);
-
-			// We need to update tags by accepting websocket again with new tags
-			// Since we can't update tags directly, we'll store the roomId in storage
-			// and check it when messages come in
-			await this.ctx.storage.put(`room:${user1Tags[0]}`, roomId);
-			await this.ctx.storage.put(`room:${user2Tags[0]}`, roomId);
-
-			// Notify both users they've been matched and joined the room
-			try {
-				user1Ws.send(
-					JSON.stringify({
-						type: "room_joined",
-						roomId,
-						partnerName: user2Tags[1],
-						message: `Matched with ${user2Tags[1]}! You can now chat.`,
-					}),
-				);
-				user2Ws.send(
-					JSON.stringify({
-						type: "room_joined",
-						roomId,
-						partnerName: user1Tags[1],
-						message: `Matched with ${user1Tags[1]}! You can now chat.`,
-					}),
-				);
-			} catch {
-				// One might have disconnected
-			}
-		}
 	}
 }
