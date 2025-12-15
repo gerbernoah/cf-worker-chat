@@ -6,9 +6,12 @@ export class Matchmaker extends DurableObject<Env> {
 	private roomAssociations: Map<string, string> = new Map();
 	private matchingScheduled = false;
 
-	// biome-ignore lint/complexity/noUselessConstructor: DO constructor needed
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
+		// Enable WebSocket hibernation to reduce memory usage when idle
+		this.ctx.setWebSocketAutoResponse(
+			new WebSocketRequestResponsePair("ping", "pong"),
+		);
 	}
 
 	private async checkRateLimit(userId: string): Promise<boolean> {
