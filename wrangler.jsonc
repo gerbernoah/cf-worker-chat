@@ -1,0 +1,32 @@
+/**
+ * For more details on how to configure Wrangler, refer to:
+ * https://developers.cloudflare.com/workers/wrangler/configuration/
+ */
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "cf-worker-chat",
+	"main": "src/index.ts",
+	"compatibility_date": "2025-12-12",
+	"observability": {
+		"enabled": true
+	},
+	"workers_dev": false,
+	"preview_urls": false,
+	"durable_objects": {
+		"bindings": [
+			{ "name": "ROOMS", "class_name": "ChatRoom" },
+			{ "name": "LIMITERS", "class_name": "RateLimiter" },
+			{ "name": "MATCHMAKER", "class_name": "Matchmaker" }
+		]
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": ["ChatRoom", "RateLimiter"]
+		},
+		{
+			"tag": "v2",
+			"new_sqlite_classes": ["Matchmaker"]
+		}
+	]
+}
